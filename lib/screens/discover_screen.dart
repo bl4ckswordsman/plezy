@@ -94,6 +94,7 @@ class _DiscoverScreenState extends State<DiscoverScreen>
   bool _isTabVisible = true;
   HiddenLibrariesProvider? _hiddenLibrariesProvider;
   Set<String> _lastSeenHiddenKeys = {};
+  Future<void>? _activeLoadFuture;
 
   // WatchStateAware: watch on-deck items and their parent shows/seasons
   @override
@@ -442,7 +443,14 @@ class _DiscoverScreenState extends State<DiscoverScreen>
     return 8.0; // Normal size
   }
 
-  Future<void> _loadContent() async {
+  Future<void> _loadContent() {
+    _activeLoadFuture ??= _doLoadContent().whenComplete(() {
+      _activeLoadFuture = null;
+    });
+    return _activeLoadFuture!;
+  }
+
+  Future<void> _doLoadContent() async {
     appLogger.d('Loading discover content from all servers');
     setState(() {
       _isLoading = true;
@@ -529,47 +537,27 @@ class _DiscoverScreenState extends State<DiscoverScreen>
       }
 
       // Wait for global hubs
-      final allHubs = await hubsFuture;
-
-      if (!mounted) return;
-
-      // Filter out Continue Watching / On Deck hubs (handled separately in hero section)
-      final filteredHubs = allHubs.where((hub) {
-        final hubId = hub.hubIdentifier?.toLowerCase() ?? '';
-        final title = hub.title.toLowerCase();
-        return !hubId.contains('ondeck') &&
-            !hubId.contains('continue') &&
-            !title.contains('continue watching') &&
-            !title.contains('on deck');
-      }).toList();
-
-      // Sort hubs by the user's library order
-      final libraryOrder = context.read<LibrariesProvider>().libraries;
-      if (libraryOrder.isNotEmpty) {
-        final orderMap = <String, int>{};
-        for (var i = 0; i < libraryOrder.length; i++) {
-          orderMap[libraryOrder[i].globalKey] = i;
+      if (settingsProvider.useGlobalHubs) {
+        final allHubs = await hubsFuture;
+        if (!mounted) return;
+        _applyHubs(allHubs);
+      } else {
+        // Progressive delivery: each library's hubs appear as they arrive
+        await for (final batch in multiServerProvider.aggregationService.streamLibraryHubs(
+          hiddenLibraryKeys: hiddenLibrariesProvider.hiddenLibraryKeys,
+          librariesByServer: librariesByServer,
+        )) {
+          if (!mounted) return;
+          _applyHubs([..._hubs, ...batch]);
         }
-        filteredHubs.sort((a, b) {
-          final aKey = _hubLibraryGlobalKey(a);
-          final bKey = _hubLibraryGlobalKey(b);
-          final aIndex = aKey != null ? orderMap[aKey] : null;
-          final bIndex = bKey != null ? orderMap[bKey] : null;
-          if (aIndex == null && bIndex == null) return 0;
-          if (aIndex == null) return 1;
-          if (bIndex == null) return -1;
-          return aIndex.compareTo(bIndex);
-        });
+        if (mounted) {
+          setState(() {
+            _areHubsLoading = false;
+          });
+        }
       }
 
-      appLogger.d('Received ${onDeck.length} on deck items and ${filteredHubs.length} global hubs from all servers');
-      if (!mounted) return;
-      setState(() {
-        _hubs = filteredHubs;
-        _areHubsLoading = false;
-        _updateHubKeys();
-      });
-
+      appLogger.d('Received ${onDeck.length} on deck items and ${_hubs.length} hubs from all servers');
       appLogger.d('Discover content loaded successfully');
     } catch (e) {
       appLogger.e('Failed to load discover content', error: e);
@@ -589,6 +577,46 @@ class _DiscoverScreenState extends State<DiscoverScreen>
     final sectionId = hub.librarySectionID ?? hub.items.firstOrNull?.librarySectionID;
     if (sectionId == null) return null;
     return buildGlobalKey(serverId, sectionId.toString());
+  }
+
+  /// Filter, sort, and apply a hub list to state.
+  /// Called by [_doLoadContent] for both the global-hubs path (once) and
+  /// the per-library streaming path (once per library batch).
+  void _applyHubs(List<PlexHub> allHubs) {
+    // Filter out Continue Watching / On Deck hubs (handled separately in hero section)
+    final filteredHubs = allHubs.where((hub) {
+      final hubId = hub.hubIdentifier?.toLowerCase() ?? '';
+      final title = hub.title.toLowerCase();
+      return !hubId.contains('ondeck') &&
+          !hubId.contains('continue') &&
+          !title.contains('continue watching') &&
+          !title.contains('on deck');
+    }).toList();
+
+    // Sort hubs by the user's library order
+    final libraryOrder = context.read<LibrariesProvider>().libraries;
+    if (libraryOrder.isNotEmpty) {
+      final orderMap = <String, int>{};
+      for (var i = 0; i < libraryOrder.length; i++) {
+        orderMap[libraryOrder[i].globalKey] = i;
+      }
+      filteredHubs.sort((a, b) {
+        final aKey = _hubLibraryGlobalKey(a);
+        final bKey = _hubLibraryGlobalKey(b);
+        final aIndex = aKey != null ? orderMap[aKey] : null;
+        final bIndex = bKey != null ? orderMap[bKey] : null;
+        if (aIndex == null && bIndex == null) return 0;
+        if (aIndex == null) return 1;
+        if (bIndex == null) return -1;
+        return aIndex.compareTo(bIndex);
+      });
+    }
+
+    setState(() {
+      _hubs = filteredHubs;
+      _areHubsLoading = false;
+      _updateHubKeys();
+    });
   }
 
   /// Refresh only the Continue Watching section in the background
