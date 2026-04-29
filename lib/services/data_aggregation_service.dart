@@ -235,6 +235,39 @@ class DataAggregationService {
     return result;
   }
 
+  Stream<List<PlexHub>> streamLibraryHubs({
+    Set<String>? hiddenLibraryKeys,
+    Map<String, List<PlexLibrary>>? librariesByServer,
+  }) async* {
+    final clients = _serverManager.onlineClients;
+    if (clients.isEmpty) return;
+
+    final libraries = librariesByServer ?? groupLibrariesByServer(await getLibrariesFromAllServers());
+
+    for (final entry in clients.entries) {
+      final serverId = entry.key;
+      final client = entry.value;
+      final serverLibraries = libraries[serverId] ?? <PlexLibrary>[];
+
+      final visibleLibraries = serverLibraries.where((lib) {
+        if (lib.type != 'movie' && lib.type != 'show') return false;
+        if (lib.hidden != null && lib.hidden != 0) return false;
+        if (hiddenLibraryKeys != null && hiddenLibraryKeys.contains(lib.globalKey)) return false;
+        return true;
+      }).toList();
+
+      for (final library in visibleLibraries) {
+        try {
+          final hubs = await client.getLibraryHubs(library.key);
+          appLogger.d('Streamed ${hubs.length} hubs for ${library.title}');
+          if (hubs.isNotEmpty) yield hubs;
+        } catch (e) {
+          appLogger.w('Failed to stream hubs for ${library.title}: $e');
+        }
+      }
+    }
+  }
+
   /// Search across all online servers
   /// Results are automatically tagged with server info by PlexClient
   Future<List<PlexMetadata>> searchAcrossServers(String query, {int? limit}) async {
